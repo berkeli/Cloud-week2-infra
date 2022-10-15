@@ -20,6 +20,6 @@ module "app" {
   name               = "app"
   subnet_id          = aws_subnet.public.id
   sg_id              = aws_security_group.main.id
-  docker_run_command = "sudo docker run -dp 80:8080 --restart unless-stopped berkeli/week2-app:latest"
+  docker_run_command = "sudo docker run -dp 80:8080 -e API1=http://${module.api-1.ip}:5000/ -e API2=http://${module.api-2.ip}:5001/ --restart unless-stopped berkeli/week2-app:latest"
 }
 
