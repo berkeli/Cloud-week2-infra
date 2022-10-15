@@ -1,3 +1,3 @@
 output "ip" {
-  value = aws_eip_association.main.public_ip
+  value = aws_instance.api.private_ip
 }
