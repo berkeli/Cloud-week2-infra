@@ -169,7 +169,223 @@ resource "aws_route_table_association" "subnet-association" {
   route_table_id = aws_route_table.main.id
 }
 ```
-In the code above, we create a route table and attach it to the subnet we created earlier. This way, our subnet can now be accessed from the internet. 
+In the code above, we create a route table and attach it to the subnet we created earlier. This way, our subnet can now connect to the internet and is no longer a private network.
+
+5. Now that we have our networking setup, we need a [security group](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group) which is a firewall. Security group decides who can connect to what.
+
+```
+resource "aws_security_group" "main" {
+  vpc_id = aws_vpc.main.id
+  egress = [
+    // allow outbound traffic to the internet
+    {
+      cidr_blocks      = ["0.0.0.0/0", ]
+      description      = ""
+      from_port        = 0
+      ipv6_cidr_blocks = []
+      prefix_list_ids  = []
+      protocol         = "-1"
+      security_groups  = []
+      self             = false
+      to_port          = 0
+    }
+  ]
+  ingress = [
+    // allow inbound traffic on port 22 which is used for SSH-ing into the ec2.
+    {
+      cidr_blocks      = ["0.0.0.0/0", ]
+      description      = ""
+      from_port        = 22
+      ipv6_cidr_blocks = []
+      prefix_list_ids  = []
+      protocol         = "tcp"
+      security_groups  = []
+      self             = false
+      to_port          = 22
+    },
+    // allow traffic on port 80 from everywhere, this is the default port for HTTP
+    {
+      cidr_blocks      = ["0.0.0.0/0", ]
+      description      = ""
+      from_port        = 80
+      ipv6_cidr_blocks = []
+      prefix_list_ids  = []
+      protocol         = "tcp"
+      security_groups  = []
+      self             = false
+      to_port          = 80
+    },
+    // allow traffic on port 5000 this is for 1 of the APIs, notice we are not providing "0.0.0.0/0" in CIDR blocks and we marked self as true, this port is open only for services already in this security group so you can't access it from public.
+    {
+      cidr_blocks      = []
+      description      = ""
+      from_port        = 5000
+      ipv6_cidr_blocks = []
+      prefix_list_ids  = []
+      protocol         = "tcp"
+      security_groups  = []
+      self             = true
+      to_port          = 5000
+    },
+    // allow traffic on port 5001 this is for the other API. Same as above, this is not accessible pulicly
+    {
+      cidr_blocks      = []
+      description      = ""
+      from_port        = 5001
+      ipv6_cidr_blocks = []
+      prefix_list_ids  = []
+      protocol         = "tcp"
+      security_groups  = []
+      self             = true
+      to_port          = 5001
+    },
+  ]
+}
+```
+That might seem a lot of code, but let's break it down. Security group has 3 main options that you need to provide:
+   1. The VPC it belongs to, in our case we link it to the main VPC we created earlier.
+   2. Ingress - this is an array of rules for inbound traffic
+   3. Egress - this is an array of rules for outbound traffic
+
+Let's take a look at the format for rules:
+
+```
+  {
+      cidr_blocks      = ["0.0.0.0/0", ] // IP addresses to allow, in this case everyone 
+      description      = ""
+      from_port        = 0
+      ipv6_cidr_blocks = []
+      prefix_list_ids  = []
+      protocol         = "-1" // -1 stands for all protocols
+      security_groups  = [] // if you want to allow traffic from other security groups, you can provide IDs
+      self             = false // if you want to allow traffic from this security group.
+      to_port          = 0
+  }
+```
+6. Now that we have our Networking completely setup, we can start creating [EC2 instances](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/instance).
+```
+resource "aws_instance" "api" {
+  // here we provide AWS Image ID. I'm using Amazon Linux 2 image, but you can use ubuntu or any other image.
+  ami                         = "ami-06672d07f62285d1d"
+  // here we provie t2.micor as instance type, which is the cheapest ec2 instance and eligible for free tier.
+  instance_type               = "t2.micro"
+  //key name will be for the key you created earlier.
+  key_name                    = "Berkeli"
+  //here we attach it to the subnet we created earlier
+  subnet_id                   = aws.aws_subnet.public.id
+  //here we indicate that we want a public IP attached
+  associate_public_ip_address = true
+  //below we indicate which security groups should be attached to this instance
+  vpc_security_group_ids      = [aws_security_group.main.id]
+
+  tags = {
+    Name = "API-1"
+  }
+```
+
+This is all it takes to create and EC2 instance, but it will not have any of your apps or APIs. Instead of connecting to each instance manually and configuring it via SSH, we can provision these instances within terraform.
+
+### Provisioning instances
+
+Terraform offers a way to connect to the instance and run commands. To connect to the instance, it needs to have a publicly accessible IP or DNS.
+
+To do this, we will be creating and Elastic IP and attaching it to the EC2 instance with the following code:
+
+```
+resource "aws_eip" "ip" {
+  vpc = true
+}
+
+resource "aws_eip_association" "main" {
+  instance_id   = aws_instance.api.id
+  allocation_id = aws_eip.ip.id
+}
+```
+After adding this code, our EC2 instance will now have a public ip that can be accessed with `self.public_ip`. We will modify the code we wrote for aws_instance to add connection:
+
+```
+resource "aws_instance" "api" {
+  ... // code from above doesn't change
+
+  // this establishes a connection to EC2 instance after it has been created. Terraform is very smart that it knows to wait for EC2 to be created, IP to be attached and only then attempt connection without requiring any async/await statements.
+  connection {
+    // type of connection is SSH
+    type        = "ssh"
+    // this is the default root user for the instance, it will be ec2-user for Amazon Linux and root for ubuntu instances
+    user        = "ec2-user"
+    // here you will need to provide the private key you saved earlier. Make sure it's the correct path
+    private_key = file("~/.ssh/Berkeli.pem")
+    // here we provide the IP address to connect to. We are using coalesce function which takes the first value that's not null.
+    host        = coalesce(self.public_ip, self.private_ip)
+  }
+
+  // the statement below is the code to execute after connection is established. In this case we are installing updates, and installing docker. After installed, we are starting docker service.
+  provisioner "remote-exec" {
+    inline = [
+      "sudo yum update -y",
+      "sudo yum install docker -y",
+      "sudo usermod -a -G docker ec2-user",
+      "sudo systemctl enable docker.service",
+      "sudo systemctl start docker.service"
+      // here you can add any commands that should be executed
+    ]
+  }
+}
+```
+This will give you a basic idea on how to setup EC2, from here you can enhance it to launch your services. In my use case, I went with an image hosted in public docker repository and launching it on the EC2 instance with following steps.
+
+Let's see and example on API-1
+
+1. Go to the folder of the API-1 and create a dockerfile: 
+```
+FROM node:12.16.1-alpine
+
+WORKDIR /usr/src/app
+
+COPY package*.json ./
+
+RUN npm install
+
+COPY . .
+
+EXPOSE 5000
+
+CMD [ "npm", "start" ]
+```
+2. Now we need to build this docker image and upload it to the [public docker repository](https://hub.docker.com/). Ensure you have docker installed locally and also logged in to docker via terminal. You can run `docker login` to ensure you are logged in.
+
+3. Go to [Docker hub and create a public repository](https://hub.docker.com/)
+
+4. Now we can build the image and upload it to the repository you created:
+  
+`docker build -t <your_username>/<repo_name>:latest . `  
+(don't miss the dot at the end, it means to build it from current directory)
+
+To push the image, you can run the following command:
+
+`docker push <your_username>/<repo_name>:latest`
+
+5. Now that your image is uploaded, we can go ahead and add the command to the EC2 provisioner.
+
+```
+provisioner "remote-exec" {
+    inline = [
+      "sudo yum update -y",
+      "sudo yum install docker -y",
+      "sudo usermod -a -G docker ec2-user",
+      "sudo systemctl enable docker.service",
+      "sudo systemctl start docker.service",
+      "sudo docker run -dp 5000:5000 --restart unless-stopped <your_username>/<repo_name>:latest:latest"      
+    ]
+  }
+```
+
+And this should have your EC2 instance provisioned with your API-1 without any requirement to do manual configuration.
+
+Please note we have note exposed port 5000 to the public, so it will not be accessible on the IP_ADDRESS:5000. It's only meant to be accessed by your flask app in the private network.
+
+You can adjust your security group settings if you would like to make it publicly accessible or repeat these steps for your flask app and see if it can access it.
+
 
 
 
